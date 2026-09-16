@@ -26,7 +26,7 @@ namespace pankey{
                         : m_workerCount(chooseWorkerCount(a_workerCount)){
                         m_workers.resize(m_workerCount);
                         m_partialNormSquares.assign(m_workerCount, 0.0);
-                        m_updateAssignments.assign(m_workerCount, std::vector<size_t>());
+                        m_updateAssignments.assign(m_workerCount, std::vector<ParameterRange>());
                         for(size_t i_worker = 0; i_worker < m_workerCount; ++i_worker){
                             m_threads.emplace_back(&CpuTransformerThreadedTrainer::workerLoop, this, i_worker);
                         }
@@ -99,8 +99,8 @@ namespace pankey{
                                         throw std::runtime_error("non-finite transformer gradients");
                                     }
                                     if(i_norm > 1.0){
-                                        m_gradientScale = 1.0f / static_cast<float>(i_norm);
-                                        runPhase(Phase::ScaleGradients);
+                                        const float i_clipScale = 1.0f / static_cast<float>(i_norm);
+                                        scaleGlobalGradient(a_model, i_clipScale);
                                     }
 
                                     setLearningRate(a_model, a_learningRate);
@@ -134,8 +134,13 @@ namespace pankey{
                         Idle,
                         AccumulateBatch,
                         ReduceScaleAndAccumulateNorm,
-                        ScaleGradients,
                         UpdateParameters
+                    };
+
+                    struct ParameterRange{
+                        size_t group = 0;
+                        size_t offset = 0;
+                        size_t size = 0;
                     };
 
                     struct Range{
@@ -150,7 +155,7 @@ namespace pankey{
                     std::vector<float> m_losses;
                     std::vector<uint32_t> m_counts;
                     std::vector<double> m_partialNormSquares;
-                    std::vector<std::vector<size_t>> m_updateAssignments;
+                    std::vector<std::vector<ParameterRange>> m_updateAssignments;
                     const std::vector<TokenSequence>* m_batch = nullptr;
                     CpuTransformer::SharedParameters m_parameters;
                     CpuTransformer::ParameterSizes m_parameterSizes;
@@ -388,7 +393,7 @@ namespace pankey{
                     }
 
                     void buildUpdateAssignments(const CpuTransformer::ParameterSizes& a_sizes){
-                        m_updateAssignments.assign(m_workerCount, std::vector<size_t>());
+                        m_updateAssignments.assign(m_workerCount, std::vector<ParameterRange>());
                         if(m_workerCount == 0){
                             return;
                         }
@@ -419,7 +424,8 @@ namespace pankey{
                                     i_bestWorker = i_worker;
                                 }
                             }
-                            m_updateAssignments[i_bestWorker].push_back(i_group);
+                            // Assign full group as a range (offset=0, size=full group size)
+                            m_updateAssignments[i_bestWorker].push_back({i_group, 0, i_groupSizes[i_group]});
                             i_loads[i_bestWorker] += i_groupSizes[i_group];
                         }
                     }
@@ -460,11 +466,6 @@ namespace pankey{
                                                                      a_model,
                                                                      a_normSquare,
                                                                      a_gradientScale);
-                                break;
-                            case Phase::ScaleGradients:
-                                runScaleGradientPhase(a_workerIndex,
-                                                      a_model.m_gradientWorkspace,
-                                                      a_gradientScale);
                                 break;
                             case Phase::UpdateParameters:
                                 runUpdatePhase(a_workerIndex, a_model);
@@ -535,38 +536,10 @@ namespace pankey{
                         }
                     }
 
-                    void runScaleGradientPhase(size_t a_workerIndex,
-                                               CpuTransformer::TrainGradients& a_gradients,
-                                               float a_scale){
-                        const Range i_range = partitionRange(totalGradientScalars(), a_workerIndex, m_workers.size());
-                        if(i_range.begin == i_range.end){
-                            return;
-                        }
-                        size_t i_globalOffset = 0;
-                        for(size_t i_group = 0; i_group < gradientTensorCount(); ++i_group){
-                            std::vector<float>& i_values = gradientTensor(a_gradients, i_group);
-                            const size_t i_groupSize = i_values.size();
-                            const size_t i_groupEnd = i_globalOffset + i_groupSize;
-                            const size_t i_begin = std::max(i_range.begin, i_globalOffset);
-                            const size_t i_end = std::min(i_range.end, i_groupEnd);
-                            if(i_begin < i_end){
-                                const size_t i_localBegin = i_begin - i_globalOffset;
-                                const size_t i_localEnd = i_end - i_globalOffset;
-                                for(size_t i_index = i_localBegin; i_index < i_localEnd; ++i_index){
-                                    i_values[i_index] *= a_scale;
-                                }
-                            }
-                            i_globalOffset = i_groupEnd;
-                            if(i_globalOffset >= i_range.end){
-                                break;
-                            }
-                        }
-                    }
-
                     void runUpdatePhase(size_t a_workerIndex,
                                         CpuTransformer& a_model){
-                        for(size_t i_group : m_updateAssignments[a_workerIndex]){
-                            if(!updateParameterGroup(a_model, i_group)){
+                        for(const ParameterRange& i_range : m_updateAssignments[a_workerIndex]){
+                            if(!updateParameterRange(a_model, i_range, m_parameterSizes)){
                                 throw std::runtime_error("transformer optimizer update failed");
                             }
                         }
@@ -585,6 +558,21 @@ namespace pankey{
                         a_model.m_optFfnUp.setLearningRate(a_learningRate);
                         a_model.m_optFfnDown.setLearningRate(a_learningRate);
                         a_model.m_optFfnNorm.setLearningRate(a_learningRate);
+                    }
+
+                    static bool updateParameterRange(CpuTransformer& a_model,
+                                                    const ParameterRange& a_range,
+                                                    const CpuTransformer::ParameterSizes& a_sizes){
+                        // Currently only supports full group updates (offset=0, size=full group size)
+                        // Future: implement range-based updates for better parallelism
+                        const size_t i_expectedSize = parameterGroupSize(a_sizes, a_range.group);
+                        
+                        // Validate that this is a full-group range
+                        if(a_range.offset != 0 || a_range.size != i_expectedSize){
+                            return false;  // Partial updates not yet supported
+                        }
+                        
+                        return updateParameterGroup(a_model, a_range.group);
                     }
 
                     static bool updateParameterGroup(CpuTransformer& a_model,
@@ -612,6 +600,19 @@ namespace pankey{
                                 return a_model.m_optFfnDown.update(a_model.m_ffnDown, a_model.m_gradientWorkspace.ffnDown);
                             default:
                                 return a_model.m_optFfnNorm.update(a_model.m_ffnNorm, a_model.m_gradientWorkspace.ffnNorm);
+                        }
+                    }
+
+                    static void scaleGlobalGradient(CpuTransformer& a_model,
+                                                      float a_scale){
+                        // Scale every scalar in the global gradient workspace by a_scale
+                        // This is used for gradient clipping after reduction
+                        // O(P) operation, not O(P×W)
+                        for(size_t i_group = 0; i_group < gradientTensorCount(); ++i_group){
+                            std::vector<float>& i_values = gradientTensor(a_model.m_gradientWorkspace, i_group);
+                            for(float& i_value : i_values){
+                                i_value *= a_scale;
+                            }
                         }
                     }
 

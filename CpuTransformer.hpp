@@ -20,11 +20,13 @@ namespace pankey{
 
             class CpuTransformerThreadedTrainer;
             class CpuTransformerThreadedRuntime;
+            class CudaTransformerRuntime;
 
             class CpuTransformer{
                 public:
                     friend class CpuTransformerThreadedTrainer;
                     friend class CpuTransformerThreadedRuntime;
+                    friend class CudaTransformerRuntime;
                     explicit CpuTransformer(const PkeLlmConfig& a_config)
                         : m_config(a_config){
                         validateConfig(m_config);
